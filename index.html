@@ -166,17 +166,65 @@ function feedback(t){
 
 function useSTT(){
   const[on,setOn]=useState(false),[tr,setTr]=useState(""),[ok,setOk]=useState(false),[reason,setReason]=useState("");
-  const recRef=useRef(null),silenceRef=useRef(null),finalRef=useRef("");
+  const recRef=useRef(null),silenceRef=useRef(null),finalRef=useRef(""),startingRef=useRef(false),supportedRef=useRef(null),needsPermissionRef=useRef(false);
   const clearSilence=useCallback(()=>{if(silenceRef.current){clearTimeout(silenceRef.current);silenceRef.current=null}},[]);
-  const stopRecognition=useCallback(()=>{clearSilence();try{recRef.current?.stop()}catch{}},[clearSilence]);
+  const disposeRecognition=useCallback(()=>{
+    if(recRef.current){
+      recRef.current.onstart=null;
+      recRef.current.onresult=null;
+      recRef.current.onspeechend=null;
+      recRef.current.onerror=null;
+      recRef.current.onend=null;
+      recRef.current=null;
+    }
+  },[]);
+  const stopRecognition=useCallback(()=>{
+    clearSilence();
+    try{recRef.current?.stop()}catch{}
+  },[clearSilence]);
   useEffect(()=>{
     const isSecure=window.isSecureContext||location.protocol==="https:"||location.hostname==="localhost"||location.hostname==="127.0.0.1";
     if(!isSecure){setReason("https");return}
     const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
     if(!SR){setReason("unsupported");return}
+    const ua=navigator.userAgent||"";
+    needsPermissionRef.current=/Android/i.test(ua)||/iPhone|iPad|iPod/i.test(ua);
+    supportedRef.current=SR;
+    setOk(true);
+    return()=>{clearSilence();stopRecognition();disposeRecognition()};
+  },[clearSilence,disposeRecognition,stopRecognition]);
+  const ensurePermission=useCallback(async()=>{
+    if(!needsPermissionRef.current||!navigator.mediaDevices?.getUserMedia)return true;
+    try{
+      const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+      stream.getTracks().forEach(track=>track.stop());
+      return true;
+    }catch(e){
+      console.warn("Mic permission preflight failed:",e);
+      setReason("denied");
+      return false;
+    }
+  },[]);
+  const start=useCallback(async()=>{
+    const SR=supportedRef.current;
+    if(!SR||on||startingRef.current)return;
+    const allowed=await ensurePermission();
+    if(!allowed)return;
+    disposeRecognition();
+    finalRef.current="";
+    setTr("");
+    setReason("");
+    clearSilence();
+    startingRef.current=true;
     const r=new SR();
-    r.lang="da-DK";r.interimResults=true;r.continuous=false;r.maxAlternatives=1;
-    r.onstart=()=>{finalRef.current="";setOn(true);setTr("");setReason("")};
+    r.lang="da-DK";
+    r.interimResults=true;
+    r.continuous=false;
+    r.maxAlternatives=1;
+    r.onstart=()=>{
+      startingRef.current=false;
+      setOn(true);
+    };
     r.onresult=e=>{
       let interim="",finalText=finalRef.current;
       for(let i=e.resultIndex;i<e.results.length;i++){
@@ -188,25 +236,43 @@ function useSTT(){
       finalRef.current=finalText;
       setTr((finalText||interim)?[finalText,interim].filter(Boolean).join(" ").trim():"");
       clearSilence();
-      silenceRef.current=setTimeout(()=>{setReason(prev=>prev||"silence");stopRecognition()},2200);
+      silenceRef.current=setTimeout(()=>{
+        setReason(prev=>prev||"silence");
+        stopRecognition();
+      },2500);
       if(finalText)stopRecognition();
     };
     r.onspeechend=()=>{stopRecognition()};
     r.onerror=e=>{
-      clearSilence();setOn(false);
+      clearSilence();
+      startingRef.current=false;
+      setOn(false);
       const map={"not-allowed":"denied","service-not-allowed":"denied","no-speech":"no-speech","audio-capture":"audio-capture","network":"network","aborted":"aborted"};
-      setReason(map[e.error]||e.error||"error");
+      const nextReason=map[e.error]||e.error||"error";
+      if(nextReason!=="aborted")setReason(nextReason);
+      disposeRecognition();
     };
-    r.onend=()=>{clearSilence();setOn(false);const text=(finalRef.current||"").trim();if(text)setTr(text)};
-    recRef.current=r;setOk(true);
-    return()=>{clearSilence();try{r.stop()}catch{}};
-  },[clearSilence,stopRecognition]);
-  const start=useCallback(()=>{
-    if(!recRef.current||on)return;
-    finalRef.current="";setTr("");setReason("");clearSilence();
-    try{recRef.current.start()}catch(e){console.warn("STT start error:",e)}
-  },[clearSilence,on]);
-  const stop=useCallback(()=>{stopRecognition();setOn(false)},[stopRecognition]);
+    r.onend=()=>{
+      clearSilence();
+      startingRef.current=false;
+      setOn(false);
+      const text=(finalRef.current||"").trim();
+      if(text)setTr(text);
+      disposeRecognition();
+    };
+    recRef.current=r;
+    try{r.start()}catch(e){
+      startingRef.current=false;
+      console.warn("STT start error:",e);
+      setReason(/not-allowed|permission|denied/i.test(String(e&&e.message||e))?"denied":"error");
+      disposeRecognition();
+    }
+  },[clearSilence,disposeRecognition,ensurePermission,on,stopRecognition]);
+  const stop=useCallback(()=>{
+    startingRef.current=false;
+    stopRecognition();
+    setOn(false);
+  },[stopRecognition]);
   return{on,tr,ok,reason,start,stop};
 }
 
