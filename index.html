@@ -143,6 +143,30 @@ async function readFileAsBase64(file){
     reader.readAsDataURL(file);
   });
 }
+async function blobToBase64(blob){
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onload=()=>resolve(String(reader.result).split(",")[1]);
+    reader.onerror=()=>reject(new Error("Kunne ikke læse lydfilen"));
+    reader.readAsDataURL(blob);
+  });
+}
+async function geminiTranscribeAudio(blob,apiKey){
+  if(!apiKey)return{error:"Ingen API-nøgle. Gå til Indstillinger."};
+  const mimeType=blob.type||"audio/webm";
+  const data=await blobToBase64(blob);
+  const prompt='Transcribe this audio as plain Danish text only. Do not translate. Return only the transcript text, with no quotes, labels, or explanation.';
+  for(const model of GEMINI_MODELS){
+    try{
+      const url=`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const r=await fetchWithTimeout(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({contents:[{role:"user",parts:[{text:prompt},{inlineData:{mimeType,data}}]}],generationConfig:{temperature:0.1,maxOutputTokens:300}})},45000);
+      const d=await r.json(),txt=(d?.candidates?.[0]?.content?.parts?.[0]?.text||"").trim();
+      if(d.error||!txt)continue;
+      return{text:txt};
+    }catch(e){continue}
+  }
+  return{error:"Kunne ikke transskribere lyden."};
+}
 
 const isDue=c=>!c.nextReview||Date.now()>=c.nextReview;
 function srsUpdate(c,q){
@@ -292,6 +316,57 @@ function useTTSPlayer(apiKey){
   const stopAudio=useCallback(()=>{if(audioRef.current){audioRef.current.pause();audioRef.current=null}setPlaying(null);window.speechSynthesis?.cancel()},[]);
   return{playing,play,stop:stopAudio};
 }
+function useRecordedSTT(apiKey){
+  const[recording,setRecording]=useState(false),[transcribing,setTranscribing]=useState(false),[tr,setTr]=useState(""),[ok,setOk]=useState(false),[reason,setReason]=useState("");
+  const recorderRef=useRef(null),chunksRef=useRef([]),streamRef=useRef(null);
+  useEffect(()=>{
+    const isSecure=window.isSecureContext||location.protocol==="https:"||location.hostname==="localhost"||location.hostname==="127.0.0.1";
+    const supported=!!(isSecure&&navigator.mediaDevices?.getUserMedia&&window.MediaRecorder);
+    setOk(supported);
+    if(!isSecure)setReason("https");
+    else if(!supported)setReason("unsupported");
+    return()=>{try{recorderRef.current?.stop()}catch{};streamRef.current?.getTracks?.().forEach(t=>t.stop())};
+  },[]);
+  const stopTracks=()=>{streamRef.current?.getTracks?.().forEach(t=>t.stop());streamRef.current=null;};
+  const start=useCallback(async()=>{
+    if(!ok||recording||transcribing)return;
+    setReason("");setTr("");
+    try{
+      const stream=await navigator.mediaDevices.getUserMedia({audio:true});
+      streamRef.current=stream;
+      const mimeTypes=["audio/webm;codecs=opus","audio/webm","audio/mp4","audio/ogg;codecs=opus"];
+      const mimeType=mimeTypes.find(t=>window.MediaRecorder.isTypeSupported?.(t))||"";
+      const recorder=new MediaRecorder(stream,mimeType?{mimeType}:{});
+      chunksRef.current=[];
+      recorder.ondataavailable=e=>{if(e.data&&e.data.size>0)chunksRef.current.push(e.data)};
+      recorder.onerror=()=>{setRecording(false);setTranscribing(false);setReason("error");stopTracks();recorderRef.current=null};
+      recorder.onstop=async()=>{
+        setRecording(false);
+        stopTracks();
+        const blob=new Blob(chunksRef.current,{type:recorder.mimeType||mimeType||"audio/webm"});
+        recorderRef.current=null;
+        if(blob.size<1200){setReason("no-speech");return}
+        setTranscribing(true);
+        const result=await geminiTranscribeAudio(blob,apiKey);
+        setTranscribing(false);
+        if(result.error){setReason("network");return}
+        setReason("");
+        setTr(result.text||"");
+      };
+      recorderRef.current=recorder;
+      recorder.start();
+      setRecording(true);
+    }catch(e){
+      setReason("denied");
+      stopTracks();
+    }
+  },[apiKey,ok,recording,transcribing]);
+  const stop=useCallback(()=>{
+    try{recorderRef.current?.stop()}catch{}
+    setRecording(false);
+  },[]);
+  return{on:recording,tr,ok,reason,start,stop,transcribing};
+}
 
 function App(){
   const[scr,setScr]=useState("home"),[scenario,setSc]=useState(null),[stats,setStats]=useState({streak:0,wordsLearned:0,sessions:0,lastDay:null});
@@ -379,12 +454,14 @@ function Scenarios({allScenarios,setScr,setSc}){
 
 function Chat({scenario,apiKey,onDone}){
   const[msgs,setMsgs]=useState([]),[inp,setInp]=useState(""),[loading,setLoading]=useState(false),[mode,setMode]=useState("text"),[showV,setShowV]=useState(false),[turns,setTurns]=useState(0),[ended,setEnded]=useState(false),[sum,setSum]=useState(null);
-  const chatRef=useRef(null),stt=useSTT(),tts=useTTSPlayer(apiKey),maxT=6;
+  const chatRef=useRef(null),stt=useSTT(),recordedSTT=useRecordedSTT(apiKey),tts=useTTSPlayer(apiKey),maxT=6;
+  const preferRecordedVoice=/Android|iPhone|iPad|iPod/i.test(navigator.userAgent||"");
+  const voice=preferRecordedVoice&&recordedSTT.ok?recordedSTT:{...stt,transcribing:false};
   useEffect(()=>{if(chatRef.current)chatRef.current.scrollTop=chatRef.current.scrollHeight},[msgs,loading]);
-  useEffect(()=>{if(typeof stt.tr==="string")setInp(stt.tr)},[stt.tr]);
+  useEffect(()=>{if(typeof voice.tr==="string"&&voice.tr)setInp(voice.tr)},[voice.tr]);
   useEffect(()=>{if(mode==="voice"&&msgs.length>0&&msgs[msgs.length-1].r==="ai")tts.play(msgs[msgs.length-1].t,msgs.length-1,"Speak warmly and clearly in natural Danish, moderate pace")},[msgs,mode]);
-  useEffect(()=>{sendAI([],true);return()=>{tts.stop();stt.stop()}},[]);
-  const toggleMic=async()=>{if(stt.on){stt.stop();return}tts.stop();stt.start()};
+  useEffect(()=>{sendAI([],true);return()=>{tts.stop();stt.stop();recordedSTT.stop()}},[]);
+  const toggleMic=async()=>{if(voice.on){voice.stop();return}tts.stop();voice.start()};
   const sys=`You are ${scenario.role} in "Dansk Daglig", a Danish learning app.\nSCENARIO: ${scenario.setup}\nRULES: Speak ONLY Danish. 1-2 short sentences. A2-B1 level. Warm. Stay in character. Model correct forms if learner makes errors. After 5-6 exchanges, wrap up naturally. NEVER use English.`;
   const sendAI=async(hist,greet)=>{
     if(!apiKey){setMsgs(p=>[...p,{r:"ai",t:"⚠️ Tilføj din Gemini API-nøgle i Indstillinger for at starte samtaler."}]);return}
@@ -411,9 +488,9 @@ function Chat({scenario,apiKey,onDone}){
     else await sendAI(hist);
   };
   const pct=Math.min((turns/maxT)*100,100);
-  const voiceMessage=stt.reason==="https"?"⚠️ Stemme kræver HTTPS. Åbn appen via en sikker webserver, f.eks. GitHub Pages.":stt.reason==="denied"?"⚠️ Mikrofon blokeret. Tillad mikrofonen i Chrome for denne side.":stt.reason==="unsupported"?"⚠️ Din browser understøtter ikke stemmegenkendelse. Prøv Chrome.":stt.reason==="no-speech"?"⚠️ Jeg hørte ingen tale. Prøv igen og tal lidt tydeligere.":stt.reason==="audio-capture"?"⚠️ Ingen mikrofon blev fundet. Tjek din enhed og browserindstillinger.":stt.reason==="network"?"⚠️ Netværksfejl under stemmegenkendelse. Prøv igen om et øjeblik.":stt.reason==="silence"?"⚠️ Lytning stoppede efter stilhed. Tryk på mikrofonen for at prøve igen.":null;
+  const voiceMessage=voice.reason==="https"?"⚠️ Stemme kræver HTTPS. Åbn appen via en sikker webserver, f.eks. GitHub Pages.":voice.reason==="denied"?"⚠️ Mikrofon blokeret. Tillad mikrofonen i Chrome for denne side.":voice.reason==="unsupported"?"⚠️ Din browser understøtter ikke stemmeinput her.":voice.reason==="no-speech"?"⚠️ Jeg hørte ingen tydelig tale. Prøv igen og tal lidt tydeligere.":voice.reason==="audio-capture"?"⚠️ Ingen mikrofon blev fundet. Tjek din enhed og browserindstillinger.":voice.reason==="network"?"⚠️ Kunne ikke transskribere lyden. Tjek netværk eller API-nøgle og prøv igen.":voice.reason==="silence"?"⚠️ Lytning stoppede efter stilhed. Tryk på mikrofonen for at prøve igen.":voice.reason==="error"?"⚠️ Stemmen kunne ikke startes. Prøv igen.":null;
   return h("div",{style:{flex:1,display:"flex",flexDirection:"column",minHeight:0}},[
-    h("div",{key:"hd",style:{padding:"12px 20px 0",display:"flex",alignItems:"center",gap:10}},[h("button",{key:"b",onClick:()=>{tts.stop();stt.stop();onDone()},style:{background:"none",border:"none",color:"var(--sky)",fontSize:13,cursor:"pointer",fontFamily:"var(--fd)",fontWeight:600}},"← Stop"),h("div",{key:"t",style:{flex:1,textAlign:"center"}},[h("div",{key:"dk",style:{fontSize:14,fontWeight:700,color:"var(--navy)",fontFamily:"var(--fd)"}},scenario.icon+" "+scenario.title),h("div",{key:"en",style:{fontSize:9,color:"var(--text-muted)"}},scenario.titleEn,mode==="voice"&&h("span",{style:{marginLeft:6,color:"var(--sky)",fontWeight:600}},"🎤 Tale"))]),h("button",{key:"v",onClick:()=>setShowV(!showV),style:{background:showV?"var(--navy)":"var(--cream-dark)",border:"none",borderRadius:8,padding:"5px 10px",cursor:"pointer",fontSize:11,fontWeight:600,color:showV?"#fff":"var(--navy)",fontFamily:"var(--fd)"}},"Ordhjælp")]),
+    h("div",{key:"hd",style:{padding:"12px 20px 0",display:"flex",alignItems:"center",gap:10}},[h("button",{key:"b",onClick:()=>{tts.stop();voice.stop();onDone()},style:{background:"none",border:"none",color:"var(--sky)",fontSize:13,cursor:"pointer",fontFamily:"var(--fd)",fontWeight:600}},"← Stop"),h("div",{key:"t",style:{flex:1,textAlign:"center"}},[h("div",{key:"dk",style:{fontSize:14,fontWeight:700,color:"var(--navy)",fontFamily:"var(--fd)"}},scenario.icon+" "+scenario.title),h("div",{key:"en",style:{fontSize:9,color:"var(--text-muted)"}},scenario.titleEn,mode==="voice"&&h("span",{style:{marginLeft:6,color:"var(--sky)",fontWeight:600}},"🎤 Tale"))]),h("button",{key:"v",onClick:()=>setShowV(!showV),style:{background:showV?"var(--navy)":"var(--cream-dark)",border:"none",borderRadius:8,padding:"5px 10px",cursor:"pointer",fontSize:11,fontWeight:600,color:showV?"#fff":"var(--navy)",fontFamily:"var(--fd)"}},"Ordhjælp")]),
     h("div",{key:"pr",style:{margin:"8px 20px 6px",height:3,background:"var(--cream-dark)",borderRadius:2}},h("div",{style:{height:"100%",width:pct+"%",background:"linear-gradient(90deg,var(--sky),var(--sky-light))",borderRadius:2,transition:"width .5s"}})),
     showV&&h("div",{key:"vp",style:{margin:"0 20px 8px",background:"#FFFBF0",border:"1px solid #F0E4CA",borderRadius:12,padding:12,animation:"fadeIn .2s"}},[h("div",{key:"t",style:{fontSize:11,fontWeight:700,color:"var(--amber)",marginBottom:6,fontFamily:"var(--fd)"}},"💡 Nyttige ord"),...(scenario.vocab||[]).map((v,i)=>{const[d,e]=v.split("|");return h("div",{key:i,style:{fontSize:12,color:"#5A4A2A",marginBottom:3}},"• "+d+(e?" ("+e+")":""))})]),
     h("div",{key:"chat",ref:chatRef,style:{flex:1,overflowY:"auto",padding:"8px 20px",display:"flex",flexDirection:"column",gap:10,minHeight:0}},[
@@ -423,9 +500,10 @@ function Chat({scenario,apiKey,onDone}){
       ended&&sum&&h("div",{key:"sum",style:{background:"linear-gradient(135deg,var(--navy),var(--navy-mid))",borderRadius:18,padding:"22px 20px",color:"var(--cream)",marginTop:8,animation:"fadeUp .4s"}},[h("div",{key:"t",style:{fontSize:16,fontWeight:800,marginBottom:14,fontFamily:"var(--fd)"}},"🎉 Opsummering"),h("div",{key:"s",style:{display:"flex",gap:16,marginBottom:16}},[{v:sum.turns,l:"Beskeder"},{v:sum.words,l:"Unikke ord"}].map((x,i)=>h("div",{key:i,style:{textAlign:"center",flex:1}},[h("div",{key:"v",style:{fontSize:26,fontWeight:800,fontFamily:"var(--fd)"}},x.v),h("div",{key:"l",style:{fontSize:10,opacity:.6}},x.l)]))),h("button",{key:"btn",className:"bh",onClick:onDone,style:{width:"100%",padding:"14px",background:"var(--sky)",border:"none",borderRadius:12,color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer",fontFamily:"var(--fd)"}},"Færdig — Tilbage")]),
     ]),
     !ended&&h("div",{key:"inp",style:{borderTop:"1px solid var(--border)",background:"var(--card)"}},[
-      stt.on&&h("div",{key:"lis",style:{padding:"10px 20px",display:"flex",alignItems:"center",gap:10,background:"linear-gradient(90deg,var(--red-light),#FFF5F5)"}},[h("div",{key:"d",style:{width:12,height:12,borderRadius:"50%",background:"var(--red)",animation:"micPulse 1s infinite"}}),h("div",{key:"t",style:{flex:1}},[h("div",{key:"l",style:{fontSize:13,color:"var(--red)",fontWeight:700,fontFamily:"var(--fd)"}},"Lytter..."),h("div",{key:"sub",style:{fontSize:11,color:"var(--text-light)",marginTop:2}},"Talen lægges kun i tekstfeltet. Du sender selv bagefter."),stt.tr&&h("div",{key:"tr",style:{fontSize:12,color:"var(--text-light)",fontStyle:"italic",marginTop:2}},'"'+stt.tr+'"')]),h("button",{key:"stop",onClick:()=>stt.stop(),style:{background:"var(--red)",border:"none",borderRadius:10,padding:"6px 16px",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"var(--fd)"}},"⏹ Stop")]),
-      h("div",{key:"row",style:{padding:"10px 20px 16px",display:"flex",gap:8,alignItems:"center"}},[h("button",{key:"tog",onClick:()=>{const n=mode==="text"?"voice":"text";setMode(n);if(n==="text"){stt.stop();tts.stop()}},style:{background:mode==="voice"?"var(--navy)":"none",border:mode==="voice"?"none":"1px solid var(--border)",borderRadius:10,width:38,height:38,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",color:mode==="voice"?"#fff":"var(--sky)",transition:"all .2s",flexShrink:0}},mode==="text"?"🎤":"⌨️"),h("div",{key:"field",style:{flex:1,display:"flex",background:"var(--cream)",border:`1.5px solid ${stt.on?"var(--red)":inp.trim()&&mode==="voice"?"var(--sky)":"var(--border)"}`,borderRadius:14,overflow:"hidden",transition:"border-color .3s"}},h("input",{value:inp,onChange:e=>setInp(e.target.value),onKeyDown:e=>e.key==="Enter"&&send(),placeholder:mode==="text"?"Skriv på dansk...":"Tryk 🎤 og tal dansk. Teksten sendes ikke automatisk.",disabled:loading||stt.on,style:{flex:1,border:"none",outline:"none",padding:"10px 14px",fontSize:14,color:"var(--text)",background:"transparent"}})),inp.trim()&&!stt.on&&h("button",{key:"send",onClick:send,disabled:loading,style:{background:"linear-gradient(135deg,var(--sky),var(--sky-light))",border:"none",borderRadius:10,width:38,height:38,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:16,flexShrink:0}},"↑"),mode==="voice"&&!stt.on&&!inp.trim()&&stt.ok&&h("button",{key:"mic",onClick:toggleMic,disabled:loading,style:{background:"linear-gradient(135deg,var(--sky),var(--sky-light))",border:"none",borderRadius:"50%",width:44,height:44,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:20,flexShrink:0,boxShadow:"0 2px 8px rgba(59,158,194,.3)"}},"🎤")]),
-      mode==="voice"&&voiceMessage&&h("div",{key:"vwarn",style:{padding:"8px 20px 12px",fontSize:11,color:stt.reason==="denied"||stt.reason==="audio-capture"||stt.reason==="network"?"var(--red)":"var(--amber)",background:stt.reason==="denied"||stt.reason==="audio-capture"||stt.reason==="network"?"#FFF5F5":"#FEF3DC",textAlign:"center",lineHeight:1.5}},voiceMessage),
+      voice.on&&h("div",{key:"lis",style:{padding:"10px 20px",display:"flex",alignItems:"center",gap:10,background:"linear-gradient(90deg,var(--red-light),#FFF5F5)"}},[h("div",{key:"d",style:{width:12,height:12,borderRadius:"50%",background:"var(--red)",animation:"micPulse 1s infinite"}}),h("div",{key:"t",style:{flex:1}},[h("div",{key:"l",style:{fontSize:13,color:"var(--red)",fontWeight:700,fontFamily:"var(--fd)"}},"Optager..."),h("div",{key:"sub",style:{fontSize:11,color:"var(--text-light)",marginTop:2}},"Stop optagelsen, så bliver lyden lavet om til tekst. Teksten sendes ikke automatisk.")]),h("button",{key:"stop",onClick:()=>voice.stop(),style:{background:"var(--red)",border:"none",borderRadius:10,padding:"6px 16px",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"var(--fd)"}},"⏹ Stop")]),
+      voice.transcribing&&h("div",{key:"trn",style:{padding:"10px 20px",display:"flex",alignItems:"center",gap:10,background:"linear-gradient(90deg,#E6F3F9,#F4FBFE)"}},[h("div",{key:"spinner",style:{width:14,height:14,border:"2px solid #B7D8E5",borderTopColor:"var(--sky)",borderRadius:"50%",animation:"spin 1s linear infinite"}}),h("div",{key:"txt",style:{fontSize:12,color:"var(--navy)",fontWeight:700,fontFamily:"var(--fd)"}},"Transskriberer din stemme...")]),
+      h("div",{key:"row",style:{padding:"10px 20px 16px",display:"flex",gap:8,alignItems:"center"}},[h("button",{key:"tog",onClick:()=>{const n=mode==="text"?"voice":"text";setMode(n);if(n==="text"){voice.stop();tts.stop()}},style:{background:mode==="voice"?"var(--navy)":"none",border:mode==="voice"?"none":"1px solid var(--border)",borderRadius:10,width:38,height:38,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",color:mode==="voice"?"#fff":"var(--sky)",transition:"all .2s",flexShrink:0}},mode==="text"?"🎤":"⌨️"),h("div",{key:"field",style:{flex:1,display:"flex",background:"var(--cream)",border:`1.5px solid ${voice.on?"var(--red)":inp.trim()&&mode==="voice"?"var(--sky)":"var(--border)"}`,borderRadius:14,overflow:"hidden",transition:"border-color .3s"}},h("input",{value:inp,onChange:e=>setInp(e.target.value),onKeyDown:e=>e.key==="Enter"&&send(),placeholder:mode==="text"?"Skriv på dansk...":"Tryk 🎤, tal dansk, og stop optagelsen. Teksten sendes ikke automatisk.",disabled:loading||voice.on||voice.transcribing,style:{flex:1,border:"none",outline:"none",padding:"10px 14px",fontSize:14,color:"var(--text)",background:"transparent"}})),inp.trim()&&!voice.on&&!voice.transcribing&&h("button",{key:"send",onClick:send,disabled:loading,style:{background:"linear-gradient(135deg,var(--sky),var(--sky-light))",border:"none",borderRadius:10,width:38,height:38,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:16,flexShrink:0}},"↑"),mode==="voice"&&!voice.on&&!voice.transcribing&&!inp.trim()&&voice.ok&&h("button",{key:"mic",onClick:toggleMic,disabled:loading,style:{background:"linear-gradient(135deg,var(--sky),var(--sky-light))",border:"none",borderRadius:"50%",width:44,height:44,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:20,flexShrink:0,boxShadow:"0 2px 8px rgba(59,158,194,.3)"}},"🎤")]),
+      mode==="voice"&&voiceMessage&&h("div",{key:"vwarn",style:{padding:"8px 20px 12px",fontSize:11,color:voice.reason==="denied"||voice.reason==="audio-capture"||voice.reason==="network"?"var(--red)":"var(--amber)",background:voice.reason==="denied"||voice.reason==="audio-capture"||voice.reason==="network"?"#FFF5F5":"#FEF3DC",textAlign:"center",lineHeight:1.5}},voiceMessage),
     ]),
   ]);
 }
